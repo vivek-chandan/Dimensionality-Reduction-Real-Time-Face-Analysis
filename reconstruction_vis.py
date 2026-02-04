@@ -1,134 +1,189 @@
+"""
+Real-time Face Detection and PCA Reconstruction Visualization
+
+This script captures video from a webcam, detects faces using YOLOv8,
+applies PCA compression/reconstruction, and displays the results side-by-side
+with compression metrics.
+"""
+
 import cv2
 import numpy as np
-from ultralytics import YOLO
+import sys
 
-###################################### VARIABLES ######################################
+# Import configuration and utilities
+import config
+from utils import (
+    load_pca_data, 
+    load_yolo_model, 
+    initialize_camera,
+    validate_face_region,
+    validate_coordinates,
+    compress_face_pca,
+    reconstruct_face_pca,
+    calculate_compression_stats
+)
 
-top_k_eigenfaces = 1000  # Number of top eigenfaces to use for compression
+# ========================== Load Models and Data ==========================
+try:
+    # Load YOLOv8 face detection model
+    model = load_yolo_model(config.YOLO_MODEL_PATH)
+    
+    # Load precomputed eigenfaces and mean face
+    eigenfaces, mean_face = load_pca_data(
+        config.EIGENFACES_PATH,
+        config.MEAN_FACES_PATH,
+        top_k=config.TOP_K_EIGENFACES
+    )
+    
+except Exception as e:
+    print(f"Failed to initialize: {e}", file=sys.stderr)
+    sys.exit(1)
 
-# YOLOv8 face detection model
-model = YOLO("./yolov8n-face-lindevs.pt")
+# ========================== Initialize Camera ==========================
+try:
+    cap = initialize_camera(config.CAMERA_INDEX)
+except RuntimeError as e:
+    print(f"Camera initialization failed: {e}", file=sys.stderr)
+    sys.exit(1)
 
-# Load precomputed eigenfaces and mean face in grayscale
-eigenfaces = np.load("./eigen_faces.npy").astype(np.float32)  # Eigenfaces matrix
-eigenfaces = eigenfaces[:, :top_k_eigenfaces]  # Use only top k eigenfaces
-mean_face = np.load("./mean_faces.npy")  # Mean face vector
-
-########################################################################################
-
-# Initialize video capture
-cap = cv2.VideoCapture(0)
+# ========================== Main Processing Loop ==========================
+print("\n✓ Starting face PCA compression visualization...")
+print("Press 'q' to quit\n")
 
 while True:
     ret, frame = cap.read()
     if not ret:
+        print("Warning: Failed to read frame from camera", file=sys.stderr)
         break
+
+    # Get frame dimensions for coordinate validation
+    frame_height, frame_width = frame.shape[:2]
 
     # Convert frame to grayscale
     gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    # Create a blank display background (colored background)
-    display_frame = np.full((500, 800, 3), (30, 30, 30), dtype=np.uint8)  # Dark gray background
+    # Create display background
+    display_frame = np.full(
+        (config.DISPLAY_SIZE[1], config.DISPLAY_SIZE[0], 3),
+        config.BACKGROUND_COLOR,
+        dtype=np.uint8
+    )
     center_x = display_frame.shape[1] // 2
     center_y = display_frame.shape[0] // 2
-    box_size = 200  # Face box size
-    border_thickness = 10  # Thickness of the colored frame
-    frame_color = (255, 0, 0)  # Blue frame (changeable)
 
-    # Run YOLO model on the frame
+    # Run YOLO face detection
     results = model(frame)
 
     for result in results:
         for box in result.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])  # Convert tensor to int coordinates
+            # Extract and validate bounding box coordinates
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            x1, y1, x2, y2 = validate_coordinates(x1, y1, x2, y2, frame_height, frame_width)
+            
+            # Extract face region
             face = gray_frame[y1:y2, x1:x2]
-            if face.size == 0:
+            
+            # Validate face region
+            if not validate_face_region(face):
                 continue
             
-            # Get original face size before resizing
+            # Calculate original face size for compression metrics
             original_h, original_w = face.shape[:2]
-            original_face_size = original_h * original_w  # Since it's grayscale
+            original_face_size = original_h * original_w  # Grayscale: 1 byte per pixel
 
-            # Resize face to match PCA eigenface dimensions
-            face_resized = cv2.resize(face, (120, 120))
+            # Resize face to standard PCA dimensions
+            face_resized = cv2.resize(face, config.FACE_SIZE)
 
-            # Flatten face to 1D vector
+            # Flatten and compress using PCA
             face_vector = face_resized.flatten()
+            compressed_representation = compress_face_pca(face_vector, eigenfaces, mean_face)
 
-            # Subtract mean face for normalization
-            face_normalized = face_vector - mean_face
+            # Reconstruct face from compressed representation
+            reconstructed_face = reconstruct_face_pca(
+                compressed_representation,
+                eigenfaces,
+                mean_face,
+                config.FACE_SIZE
+            )
 
-            # PCA Compression: Project onto eigenfaces
-            compressed_representation = eigenfaces.T @ face_normalized
-
-            # PCA Decompression: Reconstruct the face
-            reconstructed_face = eigenfaces @ compressed_representation + mean_face
-
-            # Reshape back to image dimensions and clip values
-            reconstructed_face = np.clip(reconstructed_face.reshape(120, 120), 0, 255).astype(np.uint8)
-
-            # Compute reconstruction error (MSE)
+            # Calculate reconstruction error (MSE)
             reconstruction_cost = np.mean((face_resized - reconstructed_face) ** 2)
 
-            # Compute compression percentage dynamically
-            compressed_size = top_k_eigenfaces * 4  # Each PCA coefficient = 4 bytes (float32)
-            if original_face_size > 0:
-                compression_percentage = (1 - (compressed_size / original_face_size)) * 100
-            else:
-                compression_percentage = 0  # Avoid division by zero
+            # Calculate compression statistics
+            compressed_size = config.TOP_K_EIGENFACES * 4  # 4 bytes per float32
+            compression_percentage, _ = calculate_compression_stats(
+                original_face_size,
+                compressed_size
+            )
 
-            # Ensure compression percentage is within valid bounds (0 to 100)
-            compression_percentage = max(0, min(compression_percentage, 100))
+            # Prepare faces for display
+            original_display = cv2.resize(face_resized, (config.BOX_SIZE, config.BOX_SIZE))
+            reconstructed_display = cv2.resize(reconstructed_face, (config.BOX_SIZE, config.BOX_SIZE))
 
-            # Resize for display
-            original_display = cv2.resize(face_resized, (box_size, box_size))
-            reconstructed_display = cv2.resize(reconstructed_face, (box_size, box_size))
-
-            # Convert grayscale images to BGR for colored frame
+            # Convert grayscale to BGR for display
             original_display = cv2.cvtColor(original_display, cv2.COLOR_GRAY2BGR)
             reconstructed_display = cv2.cvtColor(reconstructed_display, cv2.COLOR_GRAY2BGR)
 
-            # Define positions for left (original) and right (reconstructed) boxes
-            left_box = (center_x - box_size - 20, center_y - box_size // 2)
-            right_box = (center_x + 20, center_y - box_size // 2)
+            # Calculate positions for display boxes
+            left_box = (center_x - config.BOX_SIZE - 20, center_y - config.BOX_SIZE // 2)
+            right_box = (center_x + 20, center_y - config.BOX_SIZE // 2)
 
-            # Draw colored frame around original image
-            display_frame[left_box[1] - border_thickness:left_box[1] + box_size + border_thickness,
-                          left_box[0] - border_thickness:left_box[0] + box_size + border_thickness] = frame_color
+            # Calculate safe boundaries for border drawing
+            border = config.BORDER_THICKNESS
+            
+            # Ensure borders don't exceed frame boundaries
+            left_y1 = max(0, left_box[1] - border)
+            left_y2 = min(display_frame.shape[0], left_box[1] + config.BOX_SIZE + border)
+            left_x1 = max(0, left_box[0] - border)
+            left_x2 = min(display_frame.shape[1], left_box[0] + config.BOX_SIZE + border)
+            
+            right_y1 = max(0, right_box[1] - border)
+            right_y2 = min(display_frame.shape[0], right_box[1] + config.BOX_SIZE + border)
+            right_x1 = max(0, right_box[0] - border)
+            right_x2 = min(display_frame.shape[1], right_box[0] + config.BOX_SIZE + border)
 
-            # Draw colored frame around reconstructed image
-            display_frame[right_box[1] - border_thickness:right_box[1] + box_size + border_thickness,
-                          right_box[0] - border_thickness:right_box[0] + box_size + border_thickness] = frame_color
+            # Draw colored borders around faces
+            display_frame[left_y1:left_y2, left_x1:left_x2] = config.FRAME_COLOR
+            display_frame[right_y1:right_y2, right_x1:right_x2] = config.FRAME_COLOR
 
-            # Overlay the faces inside the frames
-            display_frame[left_box[1]:left_box[1] + box_size, left_box[0]:left_box[0] + box_size] = original_display
-            display_frame[right_box[1]:right_box[1] + box_size, right_box[0]:right_box[0] + box_size] = reconstructed_display
+            # Overlay the face images inside the frames
+            display_frame[left_box[1]:left_box[1] + config.BOX_SIZE, 
+                         left_box[0]:left_box[0] + config.BOX_SIZE] = original_display
+            display_frame[right_box[1]:right_box[1] + config.BOX_SIZE, 
+                         right_box[0]:right_box[0] + config.BOX_SIZE] = reconstructed_display
 
-            # Draw white rectangle border for a clean frame effect
+            # Draw white rectangle borders for clean frame effect
             cv2.rectangle(display_frame, 
-                          (left_box[0] - border_thickness, left_box[1] - border_thickness), 
-                          (left_box[0] + box_size + border_thickness, left_box[1] + box_size + border_thickness), 
-                          (255, 255, 255), thickness=2)
+                         (left_x1, left_y1), 
+                         (left_x2, left_y2), 
+                         (255, 255, 255), thickness=2)
 
             cv2.rectangle(display_frame, 
-                          (right_box[0] - border_thickness, right_box[1] - border_thickness), 
-                          (right_box[0] + box_size + border_thickness, right_box[1] + box_size + border_thickness), 
-                          (255, 255, 255), thickness=2)
+                         (right_x1, right_y1), 
+                         (right_x2, right_y2), 
+                         (255, 255, 255), thickness=2)
 
-            # Draw labels
-            cv2.putText(display_frame, "Original", (left_box[0], left_box[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            cv2.putText(display_frame, f"Reconstructed (Loss: {reconstruction_cost:.2f})", 
-                        (right_box[0], right_box[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            # Add labels
+            cv2.putText(display_frame, "Original", 
+                       (left_box[0], left_box[1] - 10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(display_frame, f"Reconstructed (MSE: {reconstruction_cost:.2f})", 
+                       (right_box[0], right_box[1] - 10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-            # Positioning the compression percentage text at the center below both images
-            text_position = (center_x - 100, center_y + box_size // 2 + 40)
+            # Display compression percentage
+            text_position = (center_x - 100, center_y + config.BOX_SIZE // 2 + 40)
             cv2.putText(display_frame, f"Compression: {compression_percentage:.2f}%", 
-                        text_position, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                       text_position, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-    # Show the frame
-    cv2.imshow("Face PCA Compression (Grayscale with Frame)", display_frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    # Display the frame
+    cv2.imshow("Face PCA Compression Visualization", display_frame)
+    
+    # Exit on 'q' key press
+    if cv2.waitKey(config.WAIT_KEY_DELAY) & 0xFF == ord('q'):
         break
 
+# ========================== Cleanup ==========================
 cap.release()
 cv2.destroyAllWindows()
+print("\n✓ Visualization stopped successfully")
